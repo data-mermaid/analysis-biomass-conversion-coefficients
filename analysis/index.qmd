@@ -1,0 +1,13 @@
+---
+title: "Index"
+format: 
+  html: #for website
+    embed-resources: true
+editor: visual
+---
+
+**WCS MERMAID - Biomass conversion coefficients**
+
+-   [How to change your biomass conversion coefficients](biomass_conversion_coefficients.html) (rendered html)
+
+-   [Repository](https://github.com/data-mermaid/analysis-biomass-conversion-coefficients)

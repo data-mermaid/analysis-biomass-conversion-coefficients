@@ -1,0 +1,827 @@
+---
+title: "MERMAID Fish Biomass Conversion Coefficients"
+author: "Iain R. Caldwell"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+format: 
+  html:
+    embed-resources: true
+editor: visual
+code-fold: true
+code-summary: "Show the code"
+toc: true
+title-block-banner: "#f0f3f5"
+title-block-banner-color: "black"
+include-after-body: "footer.html"
+---
+
+Fish biomass is estimated in MERMAID for each observation using the following allometric length-weight relationship:
+
+$$W = a \times L^b$$
+
+where $W$ is weight (grams), $L$ is total length (centimetres), and $a$ and $b$ are species-specific coefficients sourced from FishBase (see documentation [here](https://datamermaid.org/documentation/mermaid-reef-health-metrics)). \
+\
+This document shows how to retrieve and compare MERMAID's current biomass conversion coefficients with a previous version, explores the consequences of any differences across fish size ranges, and demonstrates how you can apply your own custom coefficients to recalculate biomass estimates at the transect and sample event level.
+
+------------------------------------------------------------------------
+
+## Getting fishbelt data and reference information from MERMAID
+
+This loads the necessary R packages and downloads fish belt data from an example public MERMAID project, together with the current MERMAID fish species reference data and a previous version of that reference.
+
+Since the code uses observation-level data, it is necessary to select a MERMAID project whose fish belt data sharing policy is set to **public -** or one of your own projects.
+
+**Note:** This step requires authentication even if you are accessing public projects. This means you need to create a free MERMAID account if you don't already have one.
+
+```{r}
+#| label: Load packages and download data
+#| warning: false
+
+rm(list = ls()) # remove past stored objects
+options(scipen = 999) # turn off scientific notation
+
+#### Load packages ####
+library(mermaidr)
+library(tidyverse)
+library(plotly)
+library(DT)
+library(readxl)
+library(knitr)
+library(scales)
+
+#### Option 1: Get data from a public project ####
+
+# Find a public project with fish belt observation data.
+# The code below searches for projects with a public fish belt policy and
+# selects the one with the most transects so there is a good spread of species.
+# it also excludes some countries from the search (Indonesia, Philippines, India)
+public_projects <- mermaid_get_summary_sampleevents() %>%
+  filter(data_policy_beltfish == "public" &
+           beltfish_sample_unit_count > 0 &
+           !country %in% c("Indonesia", "Philippines", "India")) %>%
+  group_by(project_id, project, tags, project_notes, country) %>%
+  dplyr::summarise(
+    NumSites         = length(site_id),
+    TotalSampleUnits = sum(beltfish_sample_unit_count),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(TotalSampleUnits))
+
+# Select the project with the most sample units
+example_project_id   <- public_projects$project_id[1]
+example_project_name <- public_projects$project[1]
+
+# Download all three data levels for that project
+example_data <- mermaid_get_project_data(
+  project = example_project_id,
+  method  = "fishbelt",
+  data    = "all"
+)
+
+# #### Option 2: Get data from a project for which you are a member ####
+# my_projects <- mermaid_get_my_projects()
+#
+# # Choose your project by name or index
+# example_project_id   <- my_projects$project_id[my_projects$project == "Your Project Name"]
+# example_project_name <- "Your Project Name"
+#
+# example_data <- mermaid_get_project_data(
+#   project = example_project_id,
+#   method  = "fishbelt",
+#   data    = "all"
+# )
+
+# Extract the three data levels
+observations_data <- example_data$observations
+sampleunits_data  <- example_data$sampleunits
+sampleevents_data <- example_data$sampleevents
+```
+
+```{r}
+#| label: Data loaded summary
+#| echo: false
+#| results: asis
+
+cat(paste0(
+  "<span style='color: green;'>",
+  "✓ Data loaded successfully<br>",
+  "**Project:** ", example_project_name, "<br>",
+  "**Project ID:** ", example_project_id, "<br>",
+  "**Observations:** ", nrow(observations_data), "<br>",
+  "**Sample units (transects):** ", nrow(sampleunits_data), "<br>",
+  "**Sample events:** ", nrow(sampleevents_data), "<br>",
+  "</span>"
+))
+```
+
+------------------------------------------------------------------------
+
+## Get MERMAID biomass conversion coefficients
+
+This section loads the current MERMAID reference data, with the $a$ and $b$ values that are currently being used to calculate fish biomass from each observation, and a previous version of the data (from Feb. 25).
+
+**Note:** There is also a third coefficient ($c$) that is used to convert to total length (TL) from other length types, but in MERMAID these should all be 1 (i.e. no conversion) since the $a$ and $b$ values extracted from Fishbase assume lengths are measured as TL.
+
+```{r}
+#| label: Load MERMAID reference data
+ #### Get current MERMAID fish species reference ####
+mermaid_ref_raw <- mermaid_get_reference("fishspecies")
+
+mermaid_ref <- mermaid_ref_raw %>%
+  select(
+    name,
+    genus,
+    current_a = biomass_constant_a,
+    current_b = biomass_constant_b,
+    current_c = biomass_constant_c,
+    max_length
+  ) %>% 
+  mutate(name = paste(genus, name, sep = " "))
+
+#### Get previous MERMAID fish species reference ####
+prev_ref_url   <- "https://public.datamermaid.org/mermaid_attributes_26-02-25.xlsx"
+prev_ref_local <- tempfile(fileext = ".xlsx")
+download.file(prev_ref_url, destfile = prev_ref_local, mode = "wb", quiet = TRUE)
+
+# Inspect available sheets (update the sheet name below if it differs)
+sheet_names <- readxl::excel_sheets(prev_ref_local)
+
+prev_ref_raw <- readxl::read_excel(prev_ref_local, sheet = "Fish Species")
+
+prev_ref <- prev_ref_raw %>%
+  select(
+    name = Name,
+    family = Family,
+    prev_a = `Biomass Constant A`,
+    prev_b = `Biomass Constant B`,
+    prev_c = `Biomass Constant C`,
+    prev_max_length = `Max Length (cm)`
+  )
+```
+
+------------------------------------------------------------------------
+
+## Comparing biomass conversion coefficients between versions
+
+Joins the current and previous reference sets on species ID and identifies species where the $a$ or $b$ coefficients differ.
+
+```{r}
+#| label: Compare coefficient versions
+
+# Join on species name (most reliable key between versions)
+coef_comparison <- mermaid_ref %>%
+  inner_join(prev_ref, by = "name") %>%
+  mutate(
+    diff_a = current_a - prev_a,
+    diff_b = current_b - prev_b,
+    pct_diff_a = (diff_a / prev_a) * 100,
+    pct_diff_b = (diff_b / prev_b) * 100,
+    changed    = abs(pct_diff_a)>1|abs(pct_diff_b)>1
+  )
+
+changed_species <- coef_comparison %>%
+  filter(changed) %>%
+  arrange(desc(abs(pct_diff_a) + abs(pct_diff_b)))
+
+unchanged_count <- sum(!coef_comparison$changed)
+changed_count   <- sum(coef_comparison$changed)
+total_matched   <- nrow(coef_comparison)
+```
+
+```{r}
+#| label: Comparison summary
+#| echo: false
+#| results: asis
+
+cat(paste0(
+  "<span style='color: green;'>",
+  "✓ Comparison complete<br>",
+  "**Species matched between versions:** ", total_matched, "<br>",
+  "**Species with identical coefficients:** ", unchanged_count, "<br>",
+  "**Species with changed coefficients:** ", changed_count,
+  "</span>"
+))
+```
+
+### Species with changed coefficients
+
+The table below shows all species where the $a$ or $b$ values differ between the current MERMAID reference and the previous version. Percentage differences are shown to indicate the relative magnitude of each change.
+
+```{r}
+#| label: Changed species table
+
+changed_species %>%
+  select(
+    Species      = name,
+    Family       = family,
+    `Current a`  = current_a,
+    `Previous a` = prev_a,
+    `Δa`         = diff_a,
+    `Δa (%)`     = pct_diff_a,
+    `Current b`  = current_b,
+    `Previous b` = prev_b,
+    `Δb`         = diff_b,
+    `Δb (%)`     = pct_diff_b
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(., 5))) %>%
+  DT::datatable(
+    rownames = FALSE,
+    filter   = "top",
+    options  = list(pageLength = 15, scrollX = TRUE),
+    caption  = "Species with differences in biomass conversion coefficients between the current MERMAID reference and the previous version."
+  )
+```
+
+### Visualizing coefficient differences
+
+The plot below shows how the $a$ and $b$ coefficients have shifted for species where they changed, with each line connecting the previous value (blue) to the current value (red). Species are ordered by the total magnitude of change across both coefficients.
+
+```{r}
+#| label: Coefficient differences plot
+#| warning: false
+
+plot_coef <- changed_species %>%
+  select(name, family, current_a, prev_a, current_b, prev_b,
+         pct_diff_a, pct_diff_b) %>%
+  mutate(name = fct_reorder(name, abs(pct_diff_a) + abs(pct_diff_b))) %>%
+  pivot_longer(
+    cols          = c(current_a, prev_a, current_b, prev_b),
+    names_to      = c("version", "coef"),
+    names_pattern = "(current|prev)_(a|b)",
+    values_to     = "value"
+  ) %>%
+  mutate(
+    version = factor(version, levels = c("prev", "current"),
+                     labels = c("Previous", "Current")),
+    coef    = factor(coef, levels = c("a", "b"),
+                     labels = c("Coefficient a", "Coefficient b"))
+  )
+
+p_coefs <- ggplot(plot_coef,
+                  aes(x = value, y = name, colour = version,
+                      group = interaction(name, coef),
+                      text = paste0("Species: ", name,
+                                    "<br>Version: ", version,
+                                    "<br>Value: ", round(value, 6)))) +
+  geom_line(colour = "grey70", linewidth = 0.5) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ coef, scales = "free_x") +
+  scale_colour_manual(values = c("Previous" = "#4E79A7", "Current" = "#E15759")) +
+  labs(
+    title  = "Biomass Conversion Coefficients:\nCurrent vs Previous Reference",
+    x      = "Coefficient value",
+    y      = NULL,
+    colour = "Version"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position  = "top",
+    axis.text.y      = element_text(size = 8, face = "italic", colour = "black"),
+    axis.text.x      = element_text(size = 9, colour = "black"),
+    axis.title       = element_text(size = 11, colour = "black"),
+    plot.title       = element_text(size = 13, face = "bold", hjust = 0.5),
+    strip.background = element_rect(fill = "#f0f3f5")
+  )
+
+p_plotly_coefs <- ggplotly(p_coefs, tooltip = "text") %>%
+  config(displayModeBar = TRUE,
+         displaylogo    = FALSE,
+         modeBarButtonsToRemove = c("zoom", "pan", "select", "zoomIn", "zoomOut",
+                                    "autoScale", "resetScale", "lasso2d",
+                                    "hoverClosestCartesian",
+                                    "hoverCompareCartesian")) %>%
+  layout(
+    margin = list(t = 120, b = 100, r = 20),
+    legend = list(
+      orientation = "h",
+      x           = 0.5,
+      y           = -0.15,
+      xanchor     = "center",
+      yanchor     = "top"
+    )
+  )
+
+# Remove duplicate legend entries from faceting
+seen <- c()
+for (i in seq_along(p_plotly_coefs$x$data)) {
+  trace_name <- p_plotly_coefs$x$data[[i]]$name
+  if (!is.null(trace_name)) {
+    if (trace_name %in% seen) {
+      p_plotly_coefs$x$data[[i]]$showlegend <- FALSE
+    } else {
+      seen <- c(seen, trace_name)
+    }
+  }
+}
+
+p_plotly_coefs
+```
+
+------------------------------------------------------------------------
+
+## Implications for biomass estimates across the size range
+
+For each species where the coefficients changed, we calculate what the estimated individual weight would be across the full size range of the species — from 1 cm up to its published maximum length — under both the current and previous reference. Subtracting the previous estimate from the current one at each size shows where and how much the two versions diverge.
+
+Biomass is calculated as $W = a \times L^b$ (grams, for a single fish of length $L$ cm).
+
+```{r}
+#| label: Calculate biomass curves
+
+biomass_curves <- changed_species %>%
+  filter(!is.na(max_length), max_length > 1) %>%
+  select(name, family, current_a, current_b, prev_a, prev_b, max_length) %>%
+  mutate(size_cm = map(max_length, ~ seq(1, .x, length.out = 200))) %>%
+  unnest(size_cm) %>%
+  mutate(
+    biomass_current = current_a * size_cm ^ current_b,
+    biomass_prev    = prev_a    * size_cm ^ prev_b,
+    biomass_diff    = biomass_current - biomass_prev
+  )
+```
+
+### Difference in biomass across the size range
+
+The plot below shows the difference in estimated individual fish weight (grams) between the current and previous reference coefficients at each size. Positive values indicate that the current reference predicts a higher weight; negative values indicate the opposite.
+
+```{r}
+#| label: Biomass difference plot
+#| warning: false
+
+p_diff <- ggplot(
+  biomass_curves,
+  aes(x = size_cm, y = biomass_diff/1000, colour = name, group = name,
+      text = paste0("Species: ", name,
+                    "<br>Length: ", round(size_cm, 1), " cm",
+                    "<br>Difference: ", round(biomass_diff, 2), " kg"))
+) +
+  geom_line(linewidth = 1, alpha = 0.85) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_x_continuous(labels = label_comma()) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    title  = "Difference in Fish Biomass:\nCurrent Minus Previous Coefficients",
+    x      = "Total length (cm)",
+    y      = "Biomass difference (kg)",
+    colour = "Species"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "right",
+    axis.text       = element_text(size = 9, colour = "black"),
+    axis.title      = element_text(size = 11, colour = "black"),
+    plot.title      = element_text(size = 13, face = "bold", hjust = 0.5)
+  )
+
+ggplotly(p_diff, tooltip = "text") %>%
+  config(displayModeBar = TRUE,
+         displaylogo    = FALSE,
+         modeBarButtonsToRemove = c("zoom", "pan", "select", "zoomIn", "zoomOut",
+                                    "autoScale", "resetScale", "lasso2d",
+                                    "hoverClosestCartesian",
+                                    "hoverCompareCartesian")) %>%
+  layout(legend = list(font = list(size = 10)))
+```
+
+**Interpretation:** Differences in $b$ compound exponentially with fish size, so even small changes to the exponent can lead to large absolute differences in biomass estimates for large individuals. Positive differences indicate the current reference will produce higher biomass estimates than the previous version for those species and sizes and vice versa.
+
+### Biomass curves by species
+
+The plot below shows both the current and previous biomass curves for each species, to make it easier to see at which sizes the two versions diverge. For clarity, only species with the largest absolute differences at maximum size are shown (up to 12).
+
+```{r}
+#| label: Faceted biomass curves plot
+#| warning: false
+
+# Select species with the largest differences at maximum size
+top_species <- biomass_curves %>%
+  group_by(name) %>%
+  dplyr::summarise(max_abs_diff = max(abs(biomass_diff)), .groups = "drop") %>%
+  slice_max(max_abs_diff, n = min(12, nrow(.))) %>%
+  pull(name)
+
+curves_long <- biomass_curves %>%
+  filter(name %in% top_species) %>%
+  select(name, size_cm, biomass_current, biomass_prev) %>%
+  pivot_longer(cols      = c(biomass_current, biomass_prev),
+               names_to  = "version",
+               values_to = "biomass_g") %>%
+  mutate(version = recode(version,
+                          "biomass_current" = "Current",
+                          "biomass_prev"    = "Previous"))
+
+p_facet <- ggplot(curves_long,
+                  aes(x = size_cm, y = biomass_g/1000, colour = version)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~ name, scales = "free", ncol = 3) +
+  scale_colour_manual(values = c("Current" = "#E15759", "Previous" = "#4E79A7")) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    title    = "Biomass Curves by Species: Current vs Previous Coefficients",
+    subtitle = "Showing up to 12 species with largest differences at maximum size",
+    x        = "Total length (cm)",
+    y        = "Estimated weight (kg)",
+    colour   = "Reference version"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position  = "top",
+    panel.spacing.y  = unit(2, "lines"),   # add vertical space between facet rows
+    strip.text       = element_text(size = 7, face = "italic"),
+    strip.background = element_rect(fill = "#f0f3f5"),
+    axis.text        = element_text(size = 7, colour = "black"),
+    axis.title       = element_text(size = 11, colour = "black"),
+    plot.title       = element_text(size = 13, face = "bold", hjust = 0.5),
+    plot.subtitle    = element_text(size = 10, hjust = 0.5, colour = "gray30")
+  )
+
+p_plotly <- ggplotly(p_facet, height = 700) %>%
+  config(displayModeBar = TRUE,
+         displaylogo    = FALSE,
+         modeBarButtonsToRemove = c("zoom", "pan", "select", "zoomIn", "zoomOut",
+                                    "autoScale", "resetScale", "lasso2d",
+                                    "hoverClosestCartesian",
+                                    "hoverCompareCartesian")) %>%
+  layout(
+    margin = list(t = 80, b = 130, l = 120),
+    legend = list(
+      orientation = "h",
+      x           = 0.5,
+      y           = -0.15,
+      xanchor     = "center",
+      yanchor     = "top"
+    )
+  )
+
+# Remove duplicate legend entries from faceting
+seen <- c()
+for (i in seq_along(p_plotly$x$data)) {
+  trace_name <- p_plotly$x$data[[i]]$name
+  if (!is.null(trace_name)) {
+    if (trace_name %in% seen) {
+      p_plotly$x$data[[i]]$showlegend <- FALSE
+    } else {
+      seen <- c(seen, trace_name)
+    }
+  }
+}
+
+p_plotly
+```
+
+------------------------------------------------------------------------
+
+## Using custom coefficients
+
+Researchers may have access to coefficients that are more appropriate for their study region — for example, from a regional calibration study, an updated FishBase record, or a publication specific to their survey area. This section demonstrates how to apply custom $a$ and $b$ values to recalculate biomass from raw observations and shows how those changes propagate to the transect and sample event level.
+
+### Creating a custom coefficient table
+
+To illustrate the workflow, below I create a small custom coefficient set is by taking five of the most frequently observed species in the project and applying small random adjustments (up to ±10%) to the current MERMAID coefficients. In practice, replace the `custom_coefs` table with your own data (**Note:** your own custom coefficients table should have columns for "name", "custom_a", and "custom_b").
+
+```{r}
+#| label: Create custom coefficients
+
+set.seed(42) # for reproducibility
+
+# Identify the most frequently observed species in the project data
+species_counts <- observations_data %>%
+  count(fish_taxon, sort = TRUE)
+
+# Get current MERMAID reference coefficients for species present in the project
+project_ref <- mermaid_ref %>%
+  filter(name %in% species_counts$fish_taxon)
+
+# Select the 5 most observed species that have reference coefficients
+top5_species <- species_counts %>%
+  filter(fish_taxon %in% project_ref$name) %>%
+  slice_head(n = 5) %>%
+  pull(fish_taxon)
+
+# Create custom coefficients with random shifts within ±10%
+custom_coefs <- project_ref %>%
+  filter(name %in% top5_species) %>%
+  select(name, current_a, current_b) %>%
+  mutate(
+    adj_a    = runif(n(), -0.09, 0.09),
+    adj_b    = runif(n(), -0.09, 0.09),
+    custom_a = current_a * (1 + adj_a),
+    custom_b = current_b * (1 + adj_b)
+  )
+
+# Display the custom coefficient table
+custom_coefs %>%
+  select(
+    Species           = name,
+    `MERMAID a`       = current_a,
+    `Custom a`        = custom_a,
+    `Change in a (%)` = adj_a,
+    `MERMAID b`       = current_b,
+    `Custom b`        = custom_b,
+    `Change in b (%)` = adj_b
+  ) %>%
+  mutate(
+    `Change in a (%)` = round(`Change in a (%)` * 100, 2),
+    `Change in b (%)` = round(`Change in b (%)` * 100, 2),
+    across(c(`MERMAID a`, `Custom a`, `MERMAID b`, `Custom b`), ~ round(., 6))
+  ) %>%
+  kable(
+    caption = "Custom coefficient set for demonstration. Replace with your own values in practice."
+  )
+```
+
+### Recalculating biomass from observations
+
+MERMAID calculates fish biomass at the observation level as:
+
+$$\text{Fish biomass (kg/ha)} = \underbrace{\frac{a \times L^b \times \text{count}}{\text{transect area (m}^2\text{)}}}_{\text{g/m}^2} \times \underbrace{\frac{10{,}000 \text{ m}^2}{1 \text{ ha}}}_{\text{m}^2 \to \text{ha}} \times \underbrace{\frac{1 \text{ kg}}{1{,}000 \text{ g}}}_{\text{g} \to \text{kg}}$$
+
+where the two conversion factors simplify to ×10. The code below recalculates this for each observation using the custom coefficients where available, and falls back to the MERMAID reference for all other species. These observation-level estimates are then summed to the transect level and averaged to the sample event level.
+
+> **Note:** Column names may vary slightly between MERMAID exports (mermaidr vs. xlsx downloads through the website). If the code below produces errors, check `names(observations_data)` and update the column references accordingly. The key columns needed are `fish_taxon`, `size`, `count`, `transect_len_surveyed`, and `belt_width`.
+
+```{r}
+#| label: Recalculate biomass from observations
+#| warning: false
+
+# Build coefficient lookup tables
+custom_lookup <- custom_coefs %>%
+  select(fish_taxon = name, custom_a, custom_b)
+
+ref_lookup <- mermaid_ref %>%
+  select(fish_taxon = name, ref_a = current_a, ref_b = current_b)
+
+# Join coefficients to observation data and recalculate biomass
+obs_recalc <- observations_data %>%
+  left_join(custom_lookup, by = "fish_taxon") %>%
+  left_join(ref_lookup,    by = "fish_taxon") %>%
+  mutate(
+    # Use custom coefficients where available, otherwise MERMAID reference
+    use_a = if_else(!is.na(custom_a), custom_a, ref_a),
+    use_b = if_else(!is.na(custom_b), custom_b, ref_b),
+    transect_area_m2    = transect_length * assigned_transect_width_m,
+    # Recalculate biomass density (kg/ha)
+    biomass_g_custom    = use_a * size ^ use_b * count,
+    biomass_kgha_custom = (biomass_g_custom / transect_area_m2) * 10
+  )
+```
+
+### Transect-level summaries
+
+Biomass density estimates from individual observations are summed to the transect (sample unit) level.
+
+```{r}
+#| label: Transect-level summaries
+
+su_custom <- obs_recalc %>%
+  group_by(
+    site, management, transect_number,
+    sample_date, sample_unit_id
+  ) %>%
+  dplyr::summarise(
+    biomass_kgha_mermaid = sum(biomass_kgha,        na.rm = TRUE),
+    biomass_kgha_custom  = sum(biomass_kgha_custom,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    diff_kgha = biomass_kgha_custom - biomass_kgha_mermaid,
+    diff_pct  = (diff_kgha / biomass_kgha_mermaid) * 100
+  )
+
+su_custom %>%
+  select(
+    Site                 = site,
+    Management           = management,
+    Transect             = transect_number,
+    Date                 = sample_date,
+    `MERMAID (kg/ha)`    = biomass_kgha_mermaid,
+    `Custom (kg/ha)`     = biomass_kgha_custom,
+    `Difference (kg/ha)` = diff_kgha,
+    `Difference (%)`     = diff_pct
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(., 2))) %>%
+  DT::datatable(
+    rownames = FALSE,
+    filter   = "top",
+    options  = list(pageLength = 10, scrollX = TRUE),
+    caption  = "Transect-level biomass: MERMAID reference vs custom coefficients."
+  ) %>%
+  DT::formatStyle(
+    "Difference (%)",
+    color = DT::styleInterval(0, c("#4E79A7", "#E15759"))
+  )
+```
+
+### Sample event-level summaries
+
+Transect-level estimates are averaged to the sample event level (mean across transects within the same site visit).
+
+```{r}
+#| label: Sample event-level summaries
+
+se_custom <- su_custom %>%
+  group_by(site, management, sample_date) %>%
+  dplyr::summarise(
+    n_transects          = n(),
+    mean_biomass_mermaid = mean(biomass_kgha_mermaid, na.rm = TRUE),
+    mean_biomass_custom  = mean(biomass_kgha_custom,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_diff     = mean_biomass_custom - mean_biomass_mermaid,
+    mean_diff_pct = (mean_diff / mean_biomass_mermaid) * 100
+  )
+```
+
+### Visualizing the impact of custom coefficients
+
+The grouped bar chart below compares mean site-level biomass between the MERMAID reference and custom coefficients, making it easy to identify which sites are most affected by the change. To prevent crowding in the plot, only the top 15 sample events by absolute biomass difference are shown (unless there are fewer than 15 sample events in the project).
+
+```{r}
+#| label: Site biomass comparison barplot
+#| warning: false
+
+# Limit to top site-date combinations by absolute difference between MERMAID and custom estimates
+n_to_show <- 15
+
+top_site_dates <- se_custom %>%
+  mutate(site_date = paste0(site, " (", format(as.Date(sample_date), "%Y-%m-%d"), ")")) %>%
+  slice_max(abs(mean_diff), n = n_to_show) %>%
+  pull(site_date)
+
+se_plot_data <- se_custom %>%
+  mutate(site_date = paste0(site, " (", format(as.Date(sample_date), "%Y-%m-%d"), ")")) %>%
+  filter(site_date %in% top_site_dates) %>%
+  select(site_date, mean_biomass_mermaid, mean_biomass_custom) %>%
+  pivot_longer(
+    cols      = c(mean_biomass_mermaid, mean_biomass_custom),
+    names_to  = "source",
+    values_to = "mean_biomass"
+  ) %>%
+  mutate(
+    source    = recode(source,
+                       "mean_biomass_mermaid" = "MERMAID reference",
+                       "mean_biomass_custom"  = "Custom coefficients"),
+    source    = factor(source, levels = c("MERMAID reference", "Custom coefficients")),
+    site_date = fct_reorder(site_date, mean_biomass, .fun = max)
+  )
+
+# Adjust plot height based on number of sample events shown
+plot_height <- max(300, length(top_site_dates) * 40)
+
+p_se <- ggplot(
+  se_plot_data,
+  aes(x = site_date, y = mean_biomass, fill = source,
+      text = paste0("Sample event: ", site_date,
+                    "<br>Source: ", source,
+                    "<br>Mean biomass: ", round(mean_biomass, 1), " kg/ha"))
+) +
+  geom_col(position = position_dodge(0.75), width = 0.65) +
+  coord_flip() +
+  scale_fill_manual(values = c("MERMAID reference" = "#4E79A7",
+                               "Custom coefficients" = "#E15759")) +
+  labs(
+    title    = "Mean Fish Biomass by Sample Event:\nMERMAID vs custom coefficients",
+    x        = NULL,
+    y        = "Mean biomass (kg/ha)",
+    fill     = NULL
+  ) +
+  theme_classic() +
+  theme(
+    axis.text       = element_text(size = 9, colour = "black"),
+    axis.title      = element_text(size = 11, colour = "black"),
+    plot.title      = element_text(size = 13, face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(size = 10, hjust = 0.5, colour = "gray30"),
+    legend.position = "top"
+  )
+
+ggplotly(p_se, tooltip = "text", height = plot_height) %>%
+  config(displayModeBar = TRUE,
+         displaylogo    = FALSE,
+         modeBarButtonsToRemove = c("zoom", "pan", "select", "zoomIn", "zoomOut",
+                                    "autoScale", "resetScale", "lasso2d",
+                                    "hoverClosestCartesian",
+                                    "hoverCompareCartesian")) %>%
+  layout(margin = list(t = 80, b = 120),
+         legend = list(orientation = "h",      # horizontal legend
+                       x           = 0.5,
+                       y           = -0.15,    # below the plot
+                       xanchor     = "center",
+                       yanchor     = "top"))
+```
+
+The diverging bar chart below shows the percentage difference in mean site biomass between the two approaches. Positive values (red) indicate sites where the custom coefficients give higher estimates; negative values (blue) indicate the reverse.
+
+```{r}
+#| label: Percentage difference diverging barplot
+#| warning: false
+
+se_diff_data <- se_custom %>%
+  mutate(site_date = paste0(site, " (", format(as.Date(sample_date), "%Y-%m-%d"), ")")) %>%
+  filter(site_date %in% top_site_dates) %>%
+  mutate(site_date = fct_reorder(site_date, mean_diff_pct))
+
+p_pct <- ggplot(
+  se_diff_data,
+  aes(x = mean_diff_pct, y = site_date,
+      fill = mean_diff_pct > 0,
+      text = paste0("Sample event: ", site_date,
+                    "<br>Absolute difference: ", round(mean_diff, 1), " kg/ha",
+                    "<br>% difference: ", round(mean_diff_pct, 1), "%"))
+) +
+  geom_col() +
+  geom_vline(xintercept = 0, colour = "grey30") +
+  scale_fill_manual(values = c(`TRUE` = "#E15759", `FALSE` = "#4E79A7"),
+                    guide  = "none") +
+  labs(
+    title = "% Difference in Sample Event Fish Biomass\nCustom coefficients vs. MERMAID",
+    x        = "% difference",
+    y        = NULL
+  ) +
+  theme_classic() +
+  theme(
+    axis.text     = element_text(size = 9, colour = "black"),
+    axis.title    = element_text(size = 11, colour = "black"),
+    plot.title    = element_text(size = 13, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, colour = "gray30")
+  )
+
+p_plotly <- ggplotly(p_pct, tooltip = "text", height = plot_height)
+
+# Set showlegend to FALSE on every trace
+for (i in seq_along(p_plotly$x$data)) {
+  p_plotly$x$data[[i]]$showlegend <- FALSE
+}
+
+p_plotly %>%
+  config(displayModeBar = TRUE,
+         displaylogo    = FALSE,
+         modeBarButtonsToRemove = c("zoom", "pan", "select", "zoomIn", "zoomOut",
+                                    "autoScale", "resetScale", "lasso2d",
+                                    "hoverClosestCartesian",
+                                    "hoverCompareCartesian")) %>%
+  layout(margin = list(t = 80, b = 75))
+```
+
+------------------------------------------------------------------------
+
+## Summary
+
+```{r}
+#| label: Summary
+#| echo: false
+#| results: asis
+
+# Species with the largest biomass curve divergence at maximum size
+if (nrow(biomass_curves) > 0) {
+  top_curve_species <- biomass_curves %>%
+    group_by(name) %>%
+    dplyr::summarise(max_diff_g = max(abs(biomass_diff)), .groups = "drop") %>%
+    slice_max(max_diff_g, n = 1)
+}
+
+# Site with the largest mean biomass difference from custom coefficients
+max_se_diff <- se_custom %>%
+  slice_max(abs(mean_diff), n = 1)
+
+cat(paste0(
+  "**Coefficient comparison:** ", changed_count, " of ", total_matched,
+  " matched species had at least one coefficient change between the current and ",
+  "previous MERMAID reference.\n\n",
+  "**Biomass implications:** Differences in coefficients compound with fish size, so their ",
+  "practical effect on biomass estimates is most pronounced for large individuals.",
+  if (nrow(biomass_curves) > 0) {
+    paste0(
+      " The species showing the largest divergence at maximum size was *",
+      top_curve_species$name, "*, with a maximum difference of ",
+      round(top_curve_species$max_diff_g/1000, 1), " kg per individual (at its maximum length)."
+    )
+  },
+  "\n\n",
+  "**Custom coefficient impact:** Applying the example custom coefficients (±10% adjustments ",
+  "to five species) resulted in mean site-level biomass differences of up to ",
+  round(max(abs(se_custom$mean_diff_pct), na.rm = TRUE), 1), "% (",
+  round(max(abs(se_custom$mean_diff), na.rm = TRUE), 1), " kg/ha). ",
+  "The site most affected was ", max_se_diff$site[1], ".\n\n",
+  "To use your own custom coefficients, replace the `custom_coefs` table above with a data frame ",
+  "containing columns `name` (matching the `fish_taxon` column in your observations), ",
+  "`custom_a`, and `custom_b`. The recalculation pipeline will automatically apply your values ",
+  "where available and fall back to the MERMAID reference for all other species."
+))
+```
+
+------------------------------------------------------------------------
+
+## Data and methods
+
+-   Fish belt data: accessed via the [`mermaidr`](https://github.com/data-mermaid/mermaidr) R package using `mermaid_get_project_data()`
+-   Current MERMAID fish species reference: `mermaid_get_reference("fishspecies")`
+-   Previous reference version: <https://public.datamermaid.org/mermaid_attributes_26-02-25.xlsx>
+-   Biomass formula: $W = a \times L^b$ (weight in grams, length in cm); density expressed as kg/ha
+
+------------------------------------------------------------------------
+
+```{r}
+#| label: Session info
+
+sessionInfo()
+```
