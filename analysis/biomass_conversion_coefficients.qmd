@@ -14,11 +14,11 @@ title-block-banner-color: "black"
 include-after-body: "footer.html"
 ---
 
-Fish biomass is estimated in MERMAID for each observation using the following allometric length-weight relationship:
+Fish biomass is estimated in MERMAID for each individual fish observed using the following length-weight relationship:
 
 $$W = a \times L^b$$
 
-where $W$ is weight (grams), $L$ is total length (centimetres), and $a$ and $b$ are species-specific coefficients sourced from FishBase (see documentation [here](https://datamermaid.org/documentation/mermaid-reef-health-metrics)). \
+where $W$ is weight (grams), $L$ is total length (centimetres), and $a$ and $b$ are species-specific coefficients sourced from FishBase (see documentation [here](https://datamermaid.org/documentation/mermaid-reef-health-metrics)).\
 \
 This document shows how to retrieve and compare MERMAID's current biomass conversion coefficients with a previous version, explores the consequences of any differences across fish size ranges, and demonstrates how you can apply your own custom coefficients to recalculate biomass estimates at the transect and sample event level.
 
