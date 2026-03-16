@@ -744,6 +744,22 @@ p_pct <- ggplot(
     plot.title    = element_text(size = 13, face = "bold", hjust = 0.5),
     plot.subtitle = element_text(size = 10, hjust = 0.5, colour = "gray30")
   )
+
+p_plotly <- ggplotly(p_pct, tooltip = "text", height = plot_height)
+
+# Set showlegend to FALSE on every trace
+for (i in seq_along(p_plotly$x$data)) {
+  p_plotly$x$data[[i]]$showlegend <- FALSE
+}
+
+p_plotly %>%
+  config(displayModeBar = TRUE,
+         displaylogo    = FALSE,
+         modeBarButtonsToRemove = c("zoom", "pan", "select", "zoomIn", "zoomOut",
+                                    "autoScale", "resetScale", "lasso2d",
+                                    "hoverClosestCartesian",
+                                    "hoverCompareCartesian")) %>%
+  layout(margin = list(t = 80, b = 75))
 ```
 
 ------------------------------------------------------------------------
